@@ -1,0 +1,22 @@
+{
+  "name": "ngraph.asyncforce",
+  "version": "1.0.0",
+  "description": "Force based graph layout with web workers",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "ngraph",
+    "force",
+    "layout",
+    "web",
+    "workers"
+  ],
+  "author": "Andrei Kashcha",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anvaka/ngraph.asyncforce"
+  }
+}
