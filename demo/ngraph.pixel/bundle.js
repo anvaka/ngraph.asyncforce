@@ -12,11 +12,7 @@ var renderer = renderGraph(graph, {
   // case we are providing instance of ngraph.asyncforce as layout function
   createLayout: asyncLayout,
 
-  // you can also tweak this arguments.
-
-  /**
-   * Perform layout in 3d space. asyncforce respects this argument
-   */
+  // See ../../options.js for more options
   is3d: true
 });
 
@@ -33,12 +29,13 @@ function makeGraphFromQueryString() {
   }
 }
 
-},{"../../index.js":2,"ngraph.generators":34,"ngraph.pixel":38,"query-string":87}],2:[function(require,module,exports){
+},{"../../index.js":2,"ngraph.generators":35,"ngraph.pixel":39,"query-string":88}],2:[function(require,module,exports){
 var work = require('webworkify');
 var tojson = require('ngraph.tojson');
 
 var createLayout = require('./lib/createLayout.js');
 var validateOptions = require('./options.js');
+var messageKind = require('./lib/messages.js');
 
 module.exports = createAsyncLayout;
 
@@ -50,6 +47,9 @@ function createAsyncLayout(graph, options) {
   var pendingInitialization = false;
   var initRequestSent = false;
   var systemStable = false;
+
+  // Since this is failry common message, there is no need to recreate it every time:
+  var stepMessage = { kind: messageKind.step };
 
   var positions = Object.create(null);
 
@@ -75,20 +75,61 @@ function createAsyncLayout(graph, options) {
      * @returns {object} {x: number, y: number, z: number} coordinates of a node.
      */
     getNodePosition: getNodePosition,
+
+    /**
+     * Requests layout algorithm to pin/unpin node to its current position
+     * Pinned nodes should not be affected by layout algorithm and always
+     * remain at their position
+     *
+     * @param {object} node graph node that needs to be pinned
+     * @param {boolean} isPinned status of the node.
+     */
+    pinNode: asyncPinNode,
+
+    /**
+     * Sets position of a node to a given coordinates
+     * @param {string} nodeId node identifier
+     * @param {number} x position of a node
+     * @param {number} y position of a node
+     * @param {number=} z position of node (only if 3d layout)
+     */
+    setNodePosition: asyncNodePosition
   };
 
   return api;
 
   function asyncStep() {
-    // we cannot do anything until we receive 'initialized' message from worker
+    // we cannot do anything until we receive 'initDone' message from worker
     // to confirm that it's ready to process layout requests.
     if (pendingInitialization) return;
 
-    layoutWorker.postMessage({
-      kind: 'step'
-    });
+    layoutWorker.postMessage(stepMessage);
 
+    // TODO: I need to rewrite ngraph.forcelayout to be even-driven,
+    // so that it can notify caller about stable/unstable change asynchronously
     return systemStable;
+  }
+
+  function asyncNodePosition(nodeId, x, y, z) {
+    layoutWorker.postMessage({
+      kind: messageKind.setNodePosition,
+      payload: {
+        nodeId: nodeId,
+        x: x,
+        y: y,
+        z: z
+      }
+    });
+  }
+
+  function asyncPinNode(node, isPinned) {
+    layoutWorker.postMessage({
+      kind: messageKind.pinNode,
+      payload: {
+        nodeId: node.id,
+        isPinned: isPinned
+      }
+    });
   }
 
   function initWorker() {
@@ -97,7 +138,7 @@ function createAsyncLayout(graph, options) {
     }
 
     layoutWorker.postMessage({
-      kind: 'init',
+      kind: messageKind.init,
       payload: {
         graph: tojson(graph),
         options: JSON.stringify(options)
@@ -122,12 +163,12 @@ function createAsyncLayout(graph, options) {
   }
 
   function handleMessageFromWorker(message) {
-    var messageKind = message.data.kind;
+    var kind = message.data.kind;
     var payload = message.data.payload
 
-    if (messageKind === 'pos') {
+    if (kind === messageKind.cycleComplete) {
       setPositions(payload.positions, payload.systemStable);
-    } if (messageKind === 'initialized') {
+    } if (kind === messageKind.initDone) {
       pendingInitialization = false;
       asyncStep();
     }
@@ -161,7 +202,7 @@ function assignPosition2d(oldPos, newPos) {
   oldPos.y = newPos.y;
 }
 
-},{"./lib/createLayout.js":3,"./lib/layoutWorker.js":4,"./options.js":90,"ngraph.tojson":86,"webworkify":89}],3:[function(require,module,exports){
+},{"./lib/createLayout.js":3,"./lib/layoutWorker.js":4,"./lib/messages.js":5,"./options.js":91,"ngraph.tojson":87,"webworkify":90}],3:[function(require,module,exports){
 var layout3d = require('ngraph.forcelayout3d');
 var layout2d = layout3d.get2dLayout;
 
@@ -175,10 +216,11 @@ function createLayout(graph, options) {
     layout2d(graph, options.physics);
 }
 
-},{"ngraph.forcelayout3d":5}],4:[function(require,module,exports){
+},{"ngraph.forcelayout3d":6}],4:[function(require,module,exports){
 var createLayout = require('./createLayout.js');
 var fromjson = require('ngraph.fromjson');
 var validateOptions = require('../options.js');
+var messageKind = require('./messages.js');
 
 module.exports = layoutWorker;
 
@@ -193,6 +235,7 @@ function layoutWorker(self) {
   var stepCalled = false;
   var timeoutId = 0;
   var systemStable = false;
+  var graph;
 
   var positions = Object.create(null);
   self.addEventListener('message', handleMessageFromMainThread);
@@ -203,15 +246,41 @@ function layoutWorker(self) {
     var kind = message.data.kind;
     var payload = message.data.payload;
 
-    if (kind === 'init') {
-      var graph = fromjson(payload.graph);
+    if (kind === messageKind.init) {
+      graph = fromjson(payload.graph);
       var options = JSON.parse(payload.options);
 
       init(graph, options);
-    } else if (kind === 'step') {
+    } else if (kind === messageKind.step) {
       step();
+    } else if (kind === messageKind.pinNode) {
+      pinNode(payload.nodeId, payload.isPinned);
+    } else if (kind === messageKind.setNodePosition) {
+      setNodePosition(payload.nodeId, payload.x, payload.y, payload.z);
     }
     // TODO: listen for graph changes from main thread and update layout here.
+  }
+
+  function setNodePosition(nodeId, x, y, z) {
+    assertInitialized();
+
+    layout.setNodePosition.apply(layout, arguments);
+    systemStable = false;
+    step();
+  }
+
+  function pinNode(nodeId, isPinned) {
+    assertInitialized();
+
+    var node = graph.getNode(nodeId);
+    if (!node) return; // ignoring right now. should it throw?
+
+    layout.pinNode(node, isPinned);
+  }
+
+  function assertInitialized() {
+    if (!graph) throw new Error('Pin node requested without initialied graph');
+    if (!layout) throw new Error('Layout was not created. Something is really wrong here');
   }
 
   function init(graph, options) {
@@ -224,7 +293,7 @@ function layoutWorker(self) {
     graph.forEachNode(initPosition);
 
     // let main thread know that we can process layout
-    self.postMessage({ kind: 'initialized' });
+    self.postMessage({ kind: messageKind.initDone });
   }
 
   function initPosition(node) {
@@ -232,9 +301,7 @@ function layoutWorker(self) {
   }
 
   function step() {
-    if (!layout) {
-      throw new Error('step() was called without layout being initialized. Make sure to send `init` first');
-    }
+    assertInitialized();
 
     stepCalled = true;
 
@@ -255,8 +322,10 @@ function layoutWorker(self) {
       if (stepCalled || !asyncOptions.waitForStep) {
         stepCalled = false;
         runLayoutCycleAsync();
+      } else {
+        // wait for the next event from the main thread to continue;
+        timeoutId = 0;
       }
-      timeoutId = 0;
     }, 0);
   }
 
@@ -270,10 +339,9 @@ function layoutWorker(self) {
     if (completedIterations >= asyncOptions.maxIterations) {
       systemStable = true;
     }
-    if (wasStable !== systemStable) debugger;
 
     self.postMessage({
-      kind: 'pos',
+      kind: messageKind.cycleComplete,
       payload: {
         positions: positions,
         systemStable: systemStable
@@ -282,7 +350,74 @@ function layoutWorker(self) {
   }
 };
 
-},{"../options.js":90,"./createLayout.js":3,"ngraph.fromjson":31}],5:[function(require,module,exports){
+},{"../options.js":91,"./createLayout.js":3,"./messages.js":5,"ngraph.fromjson":32}],5:[function(require,module,exports){
+/**
+ * This file defines all possible messages between main thread and
+ * web worker. The key is human readable message type, and the value is a
+ * numeric attribute for quick matching
+ */
+module.exports = {
+  /**
+   * Sent from main thread to web worker to initialize force layout
+   *
+   * payload:
+   *  {string} graph - result of ngraph.tojson(graph) operation.
+   *  {string} options - stringified optinons received by ngraph.asyncforce().
+   */
+  init: 10,
+
+  /**
+   * Sent from web worker to main thread to confirm that worker has done
+   * initializatino and can process incoming layout requests
+   *
+   * payload: undefined.
+   */
+  initDone: 11,
+
+  /**
+   * Sent from main thread to web worker to notify that rendering loop is currently
+   * active and worker should perform layout (if required). Worker can decide
+   * to ignore this request if, for example, layout is already computed, or
+   * worker has performed more than options.async.maxIterations iterations.
+   *
+   * payload: undefined.
+   */
+  step: 12,
+
+  /**
+   * Sent from webworker to main thread to indicate that worker has finished
+   * one cycle of layout iterations. Each cycle can perform up to
+   * options.asnc.stepsPerCycle iterations of layout.
+   *
+   * payload:
+   *  {object} positions - keys are node ids, values are {x, y, z} coordinates
+   *  {boolean} systemStable - indicates that system is stable. NOTE: this will
+   *  be removed from future version.
+   */
+  cycleComplete: 13,
+
+  /**
+   * Sent from main thread to web worker to pin node
+   *
+   * payload:
+   *   {string} nodeId - identifier of the node that needs to be pinned
+   *   {boolean} isPinned status of the node
+   */
+  pinNode: 41,
+
+  /**
+   * Sent from main thread to web worker to set position of the node
+   *
+   * payload:
+   *  {string} nodeId - identifier of the node that needs position update.
+   *  {number} x - x coordinate
+   *  {number} y - y coordinate
+   *  {number+} z - z coordinate - only applicable for 3d layout
+   */
+  setNodePosition: 43
+};
+
+},{}],6:[function(require,module,exports){
 /**
  * This module provides all required forces to regular ngraph.physics.simulator
  * to make it 3D simulator. Ideally ngraph.physics.simulator should operate
@@ -306,7 +441,7 @@ function createLayout(graph, physicsSettings) {
   return createLayout.get2dLayout(graph, physicsSettings);
 }
 
-},{"./lib/bounds":6,"./lib/createBody":7,"./lib/dragForce":8,"./lib/eulerIntegrator":9,"./lib/springForce":10,"ngraph.forcelayout":12,"ngraph.merge":24,"ngraph.quadtreebh3d":26}],6:[function(require,module,exports){
+},{"./lib/bounds":7,"./lib/createBody":8,"./lib/dragForce":9,"./lib/eulerIntegrator":10,"./lib/springForce":11,"ngraph.forcelayout":13,"ngraph.merge":25,"ngraph.quadtreebh3d":27}],7:[function(require,module,exports){
 module.exports = function (bodies, settings) {
   var random = require('ngraph.random').random(42);
   var boundingBox =  { x1: 0, y1: 0, z1: 0, x2: 0, y2: 0, z2: 0 };
@@ -405,14 +540,14 @@ module.exports = function (bodies, settings) {
   }
 };
 
-},{"ngraph.random":30}],7:[function(require,module,exports){
+},{"ngraph.random":31}],8:[function(require,module,exports){
 var physics = require('ngraph.physics.primitives');
 
 module.exports = function(pos) {
   return new physics.Body3d(pos);
 }
 
-},{"ngraph.physics.primitives":25}],8:[function(require,module,exports){
+},{"ngraph.physics.primitives":26}],9:[function(require,module,exports){
 /**
  * Represents 3d drag force, which reduces force value on each step by given
  * coefficient.
@@ -442,7 +577,7 @@ module.exports = function (options) {
   return api;
 };
 
-},{"ngraph.expose":11,"ngraph.merge":24}],9:[function(require,module,exports){
+},{"ngraph.expose":12,"ngraph.merge":25}],10:[function(require,module,exports){
 /**
  * Performs 3d forces integration, using given timestep. Uses Euler method to solve
  * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
@@ -492,7 +627,7 @@ function integrate(bodies, timeStep) {
   return (tx * tx + ty * ty + tz * tz)/bodies.length;
 }
 
-},{}],10:[function(require,module,exports){
+},{}],11:[function(require,module,exports){
 /**
  * Represents 3d spring force, which updates forces acting on two bodies, conntected
  * by a spring.
@@ -548,7 +683,7 @@ module.exports = function (options) {
   return api;
 }
 
-},{"ngraph.expose":11,"ngraph.merge":24,"ngraph.random":30}],11:[function(require,module,exports){
+},{"ngraph.expose":12,"ngraph.merge":25,"ngraph.random":31}],12:[function(require,module,exports){
 module.exports = exposeProperties;
 
 /**
@@ -594,7 +729,7 @@ function augment(source, target, key) {
   }
 }
 
-},{}],12:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
 module.exports = createLayout;
 module.exports.simulator = require('ngraph.physics.simulator');
 
@@ -898,7 +1033,7 @@ function createLayout(graph, physicsSettings) {
 
 function noop() { }
 
-},{"ngraph.physics.simulator":13}],13:[function(require,module,exports){
+},{"ngraph.physics.simulator":14}],14:[function(require,module,exports){
 /**
  * Manages a simulation of physical forces acting on bodies and springs.
  */
@@ -1158,7 +1293,7 @@ function physicsSimulator(settings) {
   }
 };
 
-},{"./lib/bounds":14,"./lib/createBody":15,"./lib/dragForce":16,"./lib/eulerIntegrator":17,"./lib/spring":18,"./lib/springForce":19,"ngraph.expose":11,"ngraph.merge":24,"ngraph.quadtreebh":20}],14:[function(require,module,exports){
+},{"./lib/bounds":15,"./lib/createBody":16,"./lib/dragForce":17,"./lib/eulerIntegrator":18,"./lib/spring":19,"./lib/springForce":20,"ngraph.expose":12,"ngraph.merge":25,"ngraph.quadtreebh":21}],15:[function(require,module,exports){
 module.exports = function (bodies, settings) {
   var random = require('ngraph.random').random(42);
   var boundingBox =  { x1: 0, y1: 0, x2: 0, y2: 0 };
@@ -1240,14 +1375,14 @@ module.exports = function (bodies, settings) {
   }
 }
 
-},{"ngraph.random":30}],15:[function(require,module,exports){
+},{"ngraph.random":31}],16:[function(require,module,exports){
 var physics = require('ngraph.physics.primitives');
 
 module.exports = function(pos) {
   return new physics.Body(pos);
 }
 
-},{"ngraph.physics.primitives":25}],16:[function(require,module,exports){
+},{"ngraph.physics.primitives":26}],17:[function(require,module,exports){
 /**
  * Represents drag force, which reduces force value on each step by given
  * coefficient.
@@ -1276,7 +1411,7 @@ module.exports = function (options) {
   return api;
 };
 
-},{"ngraph.expose":11,"ngraph.merge":24}],17:[function(require,module,exports){
+},{"ngraph.expose":12,"ngraph.merge":25}],18:[function(require,module,exports){
 /**
  * Performs forces integration, using given timestep. Uses Euler method to solve
  * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
@@ -1319,7 +1454,7 @@ function integrate(bodies, timeStep) {
   return (tx * tx + ty * ty)/bodies.length;
 }
 
-},{}],18:[function(require,module,exports){
+},{}],19:[function(require,module,exports){
 module.exports = Spring;
 
 /**
@@ -1335,7 +1470,7 @@ function Spring(fromBody, toBody, length, coeff, weight) {
     this.weight = typeof weight === 'number' ? weight : 1;
 };
 
-},{}],19:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 /**
  * Represents spring force, which updates forces acting on two bodies, conntected
  * by a spring.
@@ -1387,7 +1522,7 @@ module.exports = function (options) {
   return api;
 }
 
-},{"ngraph.expose":11,"ngraph.merge":24,"ngraph.random":30}],20:[function(require,module,exports){
+},{"ngraph.expose":12,"ngraph.merge":25,"ngraph.random":31}],21:[function(require,module,exports){
 /**
  * This is Barnes Hut simulation algorithm for 2d case. Implementation
  * is highly optimized (avoids recusion and gc pressure)
@@ -1713,7 +1848,7 @@ function setChild(node, idx, child) {
   else if (idx === 3) node.quad3 = child;
 }
 
-},{"./insertStack":21,"./isSamePosition":22,"./node":23,"ngraph.random":30}],21:[function(require,module,exports){
+},{"./insertStack":22,"./isSamePosition":23,"./node":24,"ngraph.random":31}],22:[function(require,module,exports){
 module.exports = InsertStack;
 
 /**
@@ -1757,7 +1892,7 @@ function InsertStackElement(node, body) {
     this.body = body; // physical body which needs to be inserted to node
 }
 
-},{}],22:[function(require,module,exports){
+},{}],23:[function(require,module,exports){
 module.exports = function isSamePosition(point1, point2) {
     var dx = Math.abs(point1.x - point2.x);
     var dy = Math.abs(point1.y - point2.y);
@@ -1765,7 +1900,7 @@ module.exports = function isSamePosition(point1, point2) {
     return (dx < 1e-8 && dy < 1e-8);
 };
 
-},{}],23:[function(require,module,exports){
+},{}],24:[function(require,module,exports){
 /**
  * Internal data structure to represent 2D QuadTree node
  */
@@ -1797,7 +1932,7 @@ module.exports = function Node() {
   this.right = 0;
 };
 
-},{}],24:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 module.exports = merge;
 
 /**
@@ -1830,7 +1965,7 @@ function merge(target, options) {
   return target;
 }
 
-},{}],25:[function(require,module,exports){
+},{}],26:[function(require,module,exports){
 module.exports = {
   Body: Body,
   Vector2d: Vector2d,
@@ -1897,7 +2032,7 @@ Vector3d.prototype.reset = function () {
   this.x = this.y = this.z = 0;
 };
 
-},{}],26:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
 /**
  * This is Barnes Hut simulation algorithm for 3d case. Implementation
  * is highly optimized (avoids recusion and gc pressure)
@@ -2292,7 +2427,7 @@ function setChild(node, idx, child) {
   else if (idx === 7) node.quad7 = child;
 }
 
-},{"./insertStack":27,"./isSamePosition":28,"./node":29,"ngraph.random":30}],27:[function(require,module,exports){
+},{"./insertStack":28,"./isSamePosition":29,"./node":30,"ngraph.random":31}],28:[function(require,module,exports){
 module.exports = InsertStack;
 
 /**
@@ -2336,7 +2471,7 @@ function InsertStackElement(node, body) {
     this.body = body; // physical body which needs to be inserted to node
 }
 
-},{}],28:[function(require,module,exports){
+},{}],29:[function(require,module,exports){
 module.exports = function isSamePosition(point1, point2) {
     var dx = Math.abs(point1.x - point2.x);
     var dy = Math.abs(point1.y - point2.y);
@@ -2345,7 +2480,7 @@ module.exports = function isSamePosition(point1, point2) {
     return (dx < 1e-8 && dy < 1e-8 && dz < 1e-8);
 };
 
-},{}],29:[function(require,module,exports){
+},{}],30:[function(require,module,exports){
 /**
  * Internal data structure to represent 3D QuadTree node
  */
@@ -2389,7 +2524,7 @@ module.exports = function Node() {
   this.back = 0;
 };
 
-},{}],30:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
 module.exports = {
   random: random,
   randomIterator: randomIterator
@@ -2476,7 +2611,7 @@ function randomIterator(array, customRandom) {
     };
 }
 
-},{}],31:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 module.exports = load;
 
 var createGraph = require('ngraph.graph');
@@ -2521,7 +2656,7 @@ function load(jsonGraph, nodeTransform, linkTransform) {
 
 function id(x) { return x; }
 
-},{"ngraph.graph":32}],32:[function(require,module,exports){
+},{"ngraph.graph":33}],33:[function(require,module,exports){
 /**
  * @fileOverview Contains definition of the core graph object.
  */
@@ -3100,7 +3235,7 @@ function makeLinkId(fromId, toId) {
   return hashCode(fromId.toString() + '👉 ' + toId.toString());
 }
 
-},{"ngraph.events":33}],33:[function(require,module,exports){
+},{"ngraph.events":34}],34:[function(require,module,exports){
 module.exports = function(subject) {
   validateSubject(subject);
 
@@ -3190,7 +3325,7 @@ function validateSubject(subject) {
   }
 }
 
-},{}],34:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 module.exports = {
   ladder: ladder,
   complete: complete,
@@ -3491,13 +3626,13 @@ function wattsStrogatz(n, k, p, seed) {
   return g;
 }
 
-},{"ngraph.graph":35,"ngraph.random":37}],35:[function(require,module,exports){
-arguments[4][32][0].apply(exports,arguments)
-},{"dup":32,"ngraph.events":36}],36:[function(require,module,exports){
+},{"ngraph.graph":36,"ngraph.random":38}],36:[function(require,module,exports){
 arguments[4][33][0].apply(exports,arguments)
-},{"dup":33}],37:[function(require,module,exports){
-arguments[4][30][0].apply(exports,arguments)
-},{"dup":30}],38:[function(require,module,exports){
+},{"dup":33,"ngraph.events":37}],37:[function(require,module,exports){
+arguments[4][34][0].apply(exports,arguments)
+},{"dup":34}],38:[function(require,module,exports){
+arguments[4][31][0].apply(exports,arguments)
+},{"dup":31}],39:[function(require,module,exports){
 module.exports = pixel;
 var THREE = require('three');
 var eventify = require('ngraph.events');
@@ -3865,7 +4000,7 @@ function pixel(graph, options) {
   }
 }
 
-},{"./lib/autoFit.js":39,"./lib/edgeView.js":42,"./lib/flyTo.js":43,"./lib/input.js":45,"./lib/nodeView.js":49,"./lib/tooltip.js":50,"./options.js":84,"ngraph.events":53,"three":83}],39:[function(require,module,exports){
+},{"./lib/autoFit.js":40,"./lib/edgeView.js":43,"./lib/flyTo.js":44,"./lib/input.js":46,"./lib/nodeView.js":50,"./lib/tooltip.js":51,"./options.js":85,"ngraph.events":54,"three":84}],40:[function(require,module,exports){
 var flyTo = require('./flyTo.js');
 module.exports = createAutoFit;
 
@@ -3881,7 +4016,7 @@ function createAutoFit(nodeView, camera) {
   }
 }
 
-},{"./flyTo.js":43}],40:[function(require,module,exports){
+},{"./flyTo.js":44}],41:[function(require,module,exports){
 var THREE = require('three');
 
 module.exports = createParticleMaterial;
@@ -3924,10 +4059,10 @@ function createParticleMaterial() {
   return material;
 }
 
-},{"./defaultTexture.js":41,"./node-fragment.js":47,"./node-vertex.js":48,"three":83}],41:[function(require,module,exports){
+},{"./defaultTexture.js":42,"./node-fragment.js":48,"./node-vertex.js":49,"three":84}],42:[function(require,module,exports){
 module.exports = 'data:image/png;base64,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';
 
-},{}],42:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 var THREE = require('three');
 
 module.exports = edgeView;
@@ -4022,7 +4157,7 @@ function edgeView(scene) {
   }
 }
 
-},{"three":83}],43:[function(require,module,exports){
+},{"three":84}],44:[function(require,module,exports){
 /**
  * Moves camera to given point, and stops it and given radius
  */
@@ -4047,7 +4182,7 @@ function flyTo(camera, to, radius) {
   camera.position.z = cameraEndPos.z;
 }
 
-},{"./intersect.js":46,"three":83}],44:[function(require,module,exports){
+},{"./intersect.js":47,"three":84}],45:[function(require,module,exports){
 /**
  * Gives an index of a node under mouse coordinates
  */
@@ -4300,7 +4435,7 @@ function createHitTest(domElement) {
   }
 }
 
-},{"ngraph.events":53,"three":83}],45:[function(require,module,exports){
+},{"ngraph.events":54,"three":84}],46:[function(require,module,exports){
 var FlyControls = require('three.fly');
 var eventify = require('ngraph.events');
 var THREE = require('three');
@@ -4375,7 +4510,7 @@ function createInput(camera, graph, domElement) {
   }
 }
 
-},{"./hitTest.js":44,"ngraph.events":53,"three":83,"three.fly":81}],46:[function(require,module,exports){
+},{"./hitTest.js":45,"ngraph.events":54,"three":84,"three.fly":82}],47:[function(require,module,exports){
 module.exports = intersect;
 
 /**
@@ -4401,7 +4536,7 @@ function intersect(from, to, r) {
   };
 }
 
-},{}],47:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 module.exports = [
 'uniform vec3 color;',
 'uniform sampler2D texture;',
@@ -4415,7 +4550,7 @@ module.exports = [
 '}'
 ].join('\n');
 
-},{}],48:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 module.exports = [
 'attribute float size;',
 'attribute vec3 customColor;',
@@ -4430,7 +4565,7 @@ module.exports = [
 '}'
 ].join('\n');
 
-},{}],49:[function(require,module,exports){
+},{}],50:[function(require,module,exports){
 var THREE = require('three');
 var particleMaterial = require('./createMaterial.js')();
 
@@ -4539,7 +4674,7 @@ function nodeView(scene) {
   }
 }
 
-},{"./createMaterial.js":40,"three":83}],50:[function(require,module,exports){
+},{"./createMaterial.js":41,"three":84}],51:[function(require,module,exports){
 /**
  * manages view for tooltips shown when user hover over a node
  */
@@ -4584,7 +4719,7 @@ function createTooltipView(container) {
   }
 }
 
-},{"../style/style.js":85,"element-class":51,"insert-css":52}],51:[function(require,module,exports){
+},{"../style/style.js":86,"element-class":52,"insert-css":53}],52:[function(require,module,exports){
 module.exports = function(opts) {
   return new ElementClass(opts)
 }
@@ -4645,7 +4780,7 @@ ElementClass.prototype.toggle = function(className) {
   else this.add(className)
 }
 
-},{}],52:[function(require,module,exports){
+},{}],53:[function(require,module,exports){
 var inserted = {};
 
 module.exports = function (css, options) {
@@ -4669,9 +4804,9 @@ module.exports = function (css, options) {
     }
 };
 
-},{}],53:[function(require,module,exports){
-arguments[4][33][0].apply(exports,arguments)
-},{"dup":33}],54:[function(require,module,exports){
+},{}],54:[function(require,module,exports){
+arguments[4][34][0].apply(exports,arguments)
+},{"dup":34}],55:[function(require,module,exports){
 /**
  * Creates a force based layout that can be switched between 3d and 2d modes
  * Layout is used by ngraph.pixel
@@ -4825,23 +4960,23 @@ function createLayout(graph, options) {
   }
 }
 
-},{"ngraph.events":53,"ngraph.forcelayout3d":55}],55:[function(require,module,exports){
-arguments[4][5][0].apply(exports,arguments)
-},{"./lib/bounds":56,"./lib/createBody":57,"./lib/dragForce":58,"./lib/eulerIntegrator":59,"./lib/springForce":60,"dup":5,"ngraph.forcelayout":62,"ngraph.merge":74,"ngraph.quadtreebh3d":76}],56:[function(require,module,exports){
+},{"ngraph.events":54,"ngraph.forcelayout3d":56}],56:[function(require,module,exports){
 arguments[4][6][0].apply(exports,arguments)
-},{"dup":6,"ngraph.random":80}],57:[function(require,module,exports){
+},{"./lib/bounds":57,"./lib/createBody":58,"./lib/dragForce":59,"./lib/eulerIntegrator":60,"./lib/springForce":61,"dup":6,"ngraph.forcelayout":63,"ngraph.merge":75,"ngraph.quadtreebh3d":77}],57:[function(require,module,exports){
 arguments[4][7][0].apply(exports,arguments)
-},{"dup":7,"ngraph.physics.primitives":75}],58:[function(require,module,exports){
+},{"dup":7,"ngraph.random":81}],58:[function(require,module,exports){
 arguments[4][8][0].apply(exports,arguments)
-},{"dup":8,"ngraph.expose":61,"ngraph.merge":74}],59:[function(require,module,exports){
+},{"dup":8,"ngraph.physics.primitives":76}],59:[function(require,module,exports){
 arguments[4][9][0].apply(exports,arguments)
-},{"dup":9}],60:[function(require,module,exports){
+},{"dup":9,"ngraph.expose":62,"ngraph.merge":75}],60:[function(require,module,exports){
 arguments[4][10][0].apply(exports,arguments)
-},{"dup":10,"ngraph.expose":61,"ngraph.merge":74,"ngraph.random":80}],61:[function(require,module,exports){
+},{"dup":10}],61:[function(require,module,exports){
 arguments[4][11][0].apply(exports,arguments)
-},{"dup":11}],62:[function(require,module,exports){
+},{"dup":11,"ngraph.expose":62,"ngraph.merge":75,"ngraph.random":81}],62:[function(require,module,exports){
 arguments[4][12][0].apply(exports,arguments)
-},{"dup":12,"ngraph.physics.simulator":63}],63:[function(require,module,exports){
+},{"dup":12}],63:[function(require,module,exports){
+arguments[4][13][0].apply(exports,arguments)
+},{"dup":13,"ngraph.physics.simulator":64}],64:[function(require,module,exports){
 /**
  * Manages a simulation of physical forces acting on bodies and springs.
  */
@@ -5097,23 +5232,21 @@ function physicsSimulator(settings) {
   }
 };
 
-},{"./lib/bounds":64,"./lib/createBody":65,"./lib/dragForce":66,"./lib/eulerIntegrator":67,"./lib/spring":68,"./lib/springForce":69,"ngraph.expose":61,"ngraph.merge":74,"ngraph.quadtreebh":70}],64:[function(require,module,exports){
-arguments[4][14][0].apply(exports,arguments)
-},{"dup":14,"ngraph.random":80}],65:[function(require,module,exports){
+},{"./lib/bounds":65,"./lib/createBody":66,"./lib/dragForce":67,"./lib/eulerIntegrator":68,"./lib/spring":69,"./lib/springForce":70,"ngraph.expose":62,"ngraph.merge":75,"ngraph.quadtreebh":71}],65:[function(require,module,exports){
 arguments[4][15][0].apply(exports,arguments)
-},{"dup":15,"ngraph.physics.primitives":75}],66:[function(require,module,exports){
+},{"dup":15,"ngraph.random":81}],66:[function(require,module,exports){
 arguments[4][16][0].apply(exports,arguments)
-},{"dup":16,"ngraph.expose":61,"ngraph.merge":74}],67:[function(require,module,exports){
+},{"dup":16,"ngraph.physics.primitives":76}],67:[function(require,module,exports){
 arguments[4][17][0].apply(exports,arguments)
-},{"dup":17}],68:[function(require,module,exports){
+},{"dup":17,"ngraph.expose":62,"ngraph.merge":75}],68:[function(require,module,exports){
 arguments[4][18][0].apply(exports,arguments)
 },{"dup":18}],69:[function(require,module,exports){
 arguments[4][19][0].apply(exports,arguments)
-},{"dup":19,"ngraph.expose":61,"ngraph.merge":74,"ngraph.random":80}],70:[function(require,module,exports){
+},{"dup":19}],70:[function(require,module,exports){
 arguments[4][20][0].apply(exports,arguments)
-},{"./insertStack":71,"./isSamePosition":72,"./node":73,"dup":20,"ngraph.random":80}],71:[function(require,module,exports){
+},{"dup":20,"ngraph.expose":62,"ngraph.merge":75,"ngraph.random":81}],71:[function(require,module,exports){
 arguments[4][21][0].apply(exports,arguments)
-},{"dup":21}],72:[function(require,module,exports){
+},{"./insertStack":72,"./isSamePosition":73,"./node":74,"dup":21,"ngraph.random":81}],72:[function(require,module,exports){
 arguments[4][22][0].apply(exports,arguments)
 },{"dup":22}],73:[function(require,module,exports){
 arguments[4][23][0].apply(exports,arguments)
@@ -5123,15 +5256,17 @@ arguments[4][24][0].apply(exports,arguments)
 arguments[4][25][0].apply(exports,arguments)
 },{"dup":25}],76:[function(require,module,exports){
 arguments[4][26][0].apply(exports,arguments)
-},{"./insertStack":77,"./isSamePosition":78,"./node":79,"dup":26,"ngraph.random":80}],77:[function(require,module,exports){
+},{"dup":26}],77:[function(require,module,exports){
 arguments[4][27][0].apply(exports,arguments)
-},{"dup":27}],78:[function(require,module,exports){
+},{"./insertStack":78,"./isSamePosition":79,"./node":80,"dup":27,"ngraph.random":81}],78:[function(require,module,exports){
 arguments[4][28][0].apply(exports,arguments)
 },{"dup":28}],79:[function(require,module,exports){
 arguments[4][29][0].apply(exports,arguments)
 },{"dup":29}],80:[function(require,module,exports){
 arguments[4][30][0].apply(exports,arguments)
 },{"dup":30}],81:[function(require,module,exports){
+arguments[4][31][0].apply(exports,arguments)
+},{"dup":31}],82:[function(require,module,exports){
 /**
  * @author James Baicoianu / http://www.baicoianu.com/
  * Source: https://github.com/mrdoob/three.js/blob/master/examples/js/controls/FlyControls.js
@@ -5409,7 +5544,7 @@ function fly(camera, domElement, THREE) {
   }
 }
 
-},{"./keymap.js":82,"ngraph.events":53}],82:[function(require,module,exports){
+},{"./keymap.js":83,"ngraph.events":54}],83:[function(require,module,exports){
 /**
  * Defines default key bindings for the controls
  */
@@ -5432,7 +5567,7 @@ function createKeyMap() {
   };
 }
 
-},{}],83:[function(require,module,exports){
+},{}],84:[function(require,module,exports){
 var self = self || {};// File:src/Three.js
 
 /**
@@ -40580,7 +40715,7 @@ if (typeof exports !== 'undefined') {
   this['THREE'] = THREE;
 }
 
-},{}],84:[function(require,module,exports){
+},{}],85:[function(require,module,exports){
 /**
  * This file contains all possible configuration optins for the renderer
  */
@@ -40618,7 +40753,7 @@ function validateOptions(options) {
   return options;
 }
 
-},{"pixel.layout":54}],85:[function(require,module,exports){
+},{"pixel.layout":55}],86:[function(require,module,exports){
 module.exports = [
 '.ngraph-tooltip {',
 '  position: absolute;',
@@ -40628,7 +40763,7 @@ module.exports = [
 '  background: rgba(0, 0, 0, 0.6);',
 '}'].join('\n');
 
-},{}],86:[function(require,module,exports){
+},{}],87:[function(require,module,exports){
 module.exports = save;
 
 function save(graph, customNodeTransform, customLinkTransform) {
@@ -40684,7 +40819,7 @@ function save(graph, customNodeTransform, customLinkTransform) {
   }
 }
 
-},{}],87:[function(require,module,exports){
+},{}],88:[function(require,module,exports){
 'use strict';
 var strictUriEncode = require('strict-uri-encode');
 
@@ -40742,7 +40877,7 @@ exports.stringify = function (obj) {
 	}).join('&') : '';
 };
 
-},{"strict-uri-encode":88}],88:[function(require,module,exports){
+},{"strict-uri-encode":89}],89:[function(require,module,exports){
 'use strict';
 module.exports = function (str) {
 	return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
@@ -40750,7 +40885,7 @@ module.exports = function (str) {
 	});
 };
 
-},{}],89:[function(require,module,exports){
+},{}],90:[function(require,module,exports){
 var bundleFn = arguments[3];
 var sources = arguments[4];
 var cache = arguments[5];
@@ -40807,7 +40942,7 @@ module.exports = function (fn) {
     ));
 };
 
-},{}],90:[function(require,module,exports){
+},{}],91:[function(require,module,exports){
 /**
  * This file defines configuration options for the asyncforce module. Every
  * configuration is optional. You can find its description and default value below.

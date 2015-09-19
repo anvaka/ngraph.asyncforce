@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "browserify demo/ngraph.pixel/index.js > demo/ngraph.pixel/bundle.js"
+    "pixi": "browserify demo/ngraph.pixi/index.js > demo/ngraph.pixi/bundle.js",
+    "pixel": "browserify demo/ngraph.pixel/index.js > demo/ngraph.pixel/bundle.js",
+    "start": "npm run pixi && npm run pixel"
   },
   "keywords": [
     "ngraph",
@@ -24,6 +26,7 @@
     "browserify": "^11.1.0",
     "ngraph.generators": "0.0.16",
     "ngraph.pixel": "^0.1.14",
+    "ngraph.pixi": "0.0.3",
     "query-string": "^2.4.1"
   },
   "dependencies": {

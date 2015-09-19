@@ -3,6 +3,7 @@ var tojson = require('ngraph.tojson');
 
 var createLayout = require('./lib/createLayout.js');
 var validateOptions = require('./options.js');
+var messageKind = require('./lib/messages.js');
 
 module.exports = createAsyncLayout;
 
@@ -14,6 +15,9 @@ function createAsyncLayout(graph, options) {
   var pendingInitialization = false;
   var initRequestSent = false;
   var systemStable = false;
+
+  // Since this is failry common message, there is no need to recreate it every time:
+  var stepMessage = { kind: messageKind.step };
 
   var positions = Object.create(null);
 
@@ -39,20 +43,61 @@ function createAsyncLayout(graph, options) {
      * @returns {object} {x: number, y: number, z: number} coordinates of a node.
      */
     getNodePosition: getNodePosition,
+
+    /**
+     * Requests layout algorithm to pin/unpin node to its current position
+     * Pinned nodes should not be affected by layout algorithm and always
+     * remain at their position
+     *
+     * @param {object} node graph node that needs to be pinned
+     * @param {boolean} isPinned status of the node.
+     */
+    pinNode: asyncPinNode,
+
+    /**
+     * Sets position of a node to a given coordinates
+     * @param {string} nodeId node identifier
+     * @param {number} x position of a node
+     * @param {number} y position of a node
+     * @param {number=} z position of node (only if 3d layout)
+     */
+    setNodePosition: asyncNodePosition
   };
 
   return api;
 
   function asyncStep() {
-    // we cannot do anything until we receive 'initialized' message from worker
+    // we cannot do anything until we receive 'initDone' message from worker
     // to confirm that it's ready to process layout requests.
     if (pendingInitialization) return;
 
-    layoutWorker.postMessage({
-      kind: 'step'
-    });
+    layoutWorker.postMessage(stepMessage);
 
+    // TODO: I need to rewrite ngraph.forcelayout to be even-driven,
+    // so that it can notify caller about stable/unstable change asynchronously
     return systemStable;
+  }
+
+  function asyncNodePosition(nodeId, x, y, z) {
+    layoutWorker.postMessage({
+      kind: messageKind.setNodePosition,
+      payload: {
+        nodeId: nodeId,
+        x: x,
+        y: y,
+        z: z
+      }
+    });
+  }
+
+  function asyncPinNode(node, isPinned) {
+    layoutWorker.postMessage({
+      kind: messageKind.pinNode,
+      payload: {
+        nodeId: node.id,
+        isPinned: isPinned
+      }
+    });
   }
 
   function initWorker() {
@@ -61,7 +106,7 @@ function createAsyncLayout(graph, options) {
     }
 
     layoutWorker.postMessage({
-      kind: 'init',
+      kind: messageKind.init,
       payload: {
         graph: tojson(graph),
         options: JSON.stringify(options)
@@ -86,12 +131,12 @@ function createAsyncLayout(graph, options) {
   }
 
   function handleMessageFromWorker(message) {
-    var messageKind = message.data.kind;
+    var kind = message.data.kind;
     var payload = message.data.payload
 
-    if (messageKind === 'pos') {
+    if (kind === messageKind.cycleComplete) {
       setPositions(payload.positions, payload.systemStable);
-    } if (messageKind === 'initialized') {
+    } if (kind === messageKind.initDone) {
       pendingInitialization = false;
       asyncStep();
     }
