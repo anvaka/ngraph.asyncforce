@@ -15,6 +15,9 @@ function createAsyncLayout(graph, options) {
   var pendingInitialization = false;
   var initRequestSent = false;
   var systemStable = false;
+  var graphRect;
+  var pinStatus = Object.create(null);
+  var linkPositions;
 
   // Since this is failry common message, there is no need to recreate it every time:
   var stepMessage = { kind: messageKind.step };
@@ -45,6 +48,16 @@ function createAsyncLayout(graph, options) {
     getNodePosition: getNodePosition,
 
     /**
+     * Gets the last known position of a given link by its identifier.
+     *
+     * @param {string} linkId identifier of a link in question.
+     * @returns {Object} Link position by link id
+     * @returns {Object.from} {x, y} coordinates of link start
+     * @returns {Object.to} {x, y} coordinates of link end
+     */
+    getLinkPosition: getLinkPosition,
+
+    /**
      * Requests layout algorithm to pin/unpin node to its current position
      * Pinned nodes should not be affected by layout algorithm and always
      * remain at their position
@@ -61,7 +74,18 @@ function createAsyncLayout(graph, options) {
      * @param {number} y position of a node
      * @param {number=} z position of node (only if 3d layout)
      */
-    setNodePosition: asyncNodePosition
+    setNodePosition: asyncNodePosition,
+
+    /**
+     * Gets rectange (or a box) that bounds the graph
+     */
+    getGraphRect: getGraphRect,
+
+    /**
+     * Returns true if node is currently pinned (i.e. not moved by layout);
+     * False otherwise.
+     */
+    isNodePinned: isNodePinned
   };
 
   return api;
@@ -79,6 +103,7 @@ function createAsyncLayout(graph, options) {
   }
 
   function asyncNodePosition(nodeId, x, y, z) {
+    // let layout know that we changed the position
     layoutWorker.postMessage({
       kind: messageKind.setNodePosition,
       payload: {
@@ -88,6 +113,12 @@ function createAsyncLayout(graph, options) {
         z: z
       }
     });
+    // also update synchronously our last remember position:
+    assignPosition(positions[nodeId], { x: x, y: y, z: z });
+  }
+
+  function getGraphRect() {
+    return graphRect;
   }
 
   function asyncPinNode(node, isPinned) {
@@ -98,6 +129,15 @@ function createAsyncLayout(graph, options) {
         isPinned: isPinned
       }
     });
+
+    // we need to have sync way of answering to isNodePinned request.
+    // This is not perfect, since original graph configuration may
+    // include pinned nodes. We currently do not take that into account.
+    pinStatus[node.id] = isPinned;
+  }
+
+  function isNodePinned(node) {
+    return pinStatus[node.id];
   }
 
   function initWorker() {
@@ -120,6 +160,7 @@ function createAsyncLayout(graph, options) {
     // we need to initialize positions just once
     var layout = createLayout(graph, options);
     graph.forEachNode(initPosition);
+    graphRect = layout.getGraphRect();
 
     function initPosition(node) {
       positions[node.id] = layout.getNodePosition(node.id);
@@ -130,12 +171,30 @@ function createAsyncLayout(graph, options) {
     return positions[nodeId];
   }
 
+  function getLinkPosition(linkId) {
+    if (!linkPositions) {
+      initializeLinkPositions();
+    }
+    return linkPositions[linkId];
+  }
+
+  function initializeLinkPositions() {
+    linkPositions = Object.create(null);
+    graph.forEachLink(function(link) {
+      linkPositions[link.id] = {
+        from: getNodePosition(link.fromId),
+        to: getNodePosition(link.toId)
+      };
+    });
+  }
+
   function handleMessageFromWorker(message) {
     var kind = message.data.kind;
     var payload = message.data.payload
 
     if (kind === messageKind.cycleComplete) {
       setPositions(payload.positions, payload.systemStable);
+      graphRect = payload.bbox;
     } if (kind === messageKind.initDone) {
       pendingInitialization = false;
       asyncStep();

@@ -5,9 +5,10 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "viva": "browserify demo/vivagraph/index.js > demo/vivagraph/bundle.js",
     "pixi": "browserify demo/ngraph.pixi/index.js > demo/ngraph.pixi/bundle.js",
     "pixel": "browserify demo/ngraph.pixel/index.js > demo/ngraph.pixel/bundle.js",
-    "start": "npm run pixi && npm run pixel"
+    "start": "npm run pixi && npm run pixel && npm run viva"
   },
   "keywords": [
     "ngraph",
@@ -27,7 +28,8 @@
     "ngraph.generators": "0.0.16",
     "ngraph.pixel": "^0.1.14",
     "ngraph.pixi": "0.0.3",
-    "query-string": "^2.4.1"
+    "query-string": "^2.4.1",
+    "vivagraphjs": "^0.8.1"
   },
   "dependencies": {
     "ngraph.forcelayout3d": "0.0.13",
