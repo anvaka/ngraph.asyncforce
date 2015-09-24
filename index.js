@@ -1,5 +1,6 @@
 var work = require('webworkify');
 var tojson = require('ngraph.tojson');
+var eventify = require('ngraph.events');
 
 var createLayout = require('./lib/createLayout.js');
 var validateOptions = require('./options.js');
@@ -19,7 +20,7 @@ function createAsyncLayout(graph, options) {
   var pinStatus = Object.create(null);
   var linkPositions;
 
-  // Since this is failry common message, there is no need to recreate it every time:
+  // Since this is fairly common message, there is no need to recreate it every time:
   var stepMessage = { kind: messageKind.step };
 
   var positions = Object.create(null);
@@ -77,7 +78,7 @@ function createAsyncLayout(graph, options) {
     setNodePosition: asyncNodePosition,
 
     /**
-     * Gets rectange (or a box) that bounds the graph
+     * Gets rectangle (or a box) that bounds the graph
      */
     getGraphRect: getGraphRect,
 
@@ -87,6 +88,8 @@ function createAsyncLayout(graph, options) {
      */
     isNodePinned: isNodePinned
   };
+
+  eventify(api);
 
   return api;
 
@@ -195,6 +198,7 @@ function createAsyncLayout(graph, options) {
     if (kind === messageKind.cycleComplete) {
       setPositions(payload.positions, payload.systemStable);
       graphRect = payload.bbox;
+      api.fire('cycle', payload.iterations, payload.systemStable);
     } if (kind === messageKind.initDone) {
       pendingInitialization = false;
       asyncStep();

@@ -32,6 +32,7 @@
     "vivagraphjs": "^0.8.1"
   },
   "dependencies": {
+    "ngraph.events": "0.0.3",
     "ngraph.forcelayout3d": "0.0.13",
     "ngraph.fromjson": "^0.1.8",
     "ngraph.tojson": "^0.1.4",

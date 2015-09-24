@@ -4,21 +4,46 @@ var Viva = require('vivagraphjs');
 
 var graph = makeGraphFromQueryString();
 
+// we will run compute graph layout offline, and after 100 iterations will
+// use constant layout from vivagraph.
+// we want to have 150 iterations total
+var iterationsToCompute = 150;
+// and get notification after each 10th iterations:
+var stepsPerCycle = 10;
+
 var layout = asyncLayout(graph, {
-  physics: {
-    springLength: 10,
-    springCoeff: 0.0005,
-    dragCoeff: 0.02,
-    gravity: -1.2
+  async: {
+    maxIterations: iterationsToCompute,
+    stepsPerCycle: stepsPerCycle,
+
+    // Run it till the end:
+    waitForStep: false
   }
 });
 
-var graphics = Viva.Graph.View.webglGraphics();
-var renderer = Viva.Graph.View.renderer(graph, {
-    layout : layout,
+layout.on('cycle', onCycle);
+
+function onCycle(completedIterations, isStable) {
+  if (completedIterations >= iterationsToCompute || isStable) {
+    renderGraph();
+  } else {
+    document.getElementById('progress').innerHTML = 'Completed ' + completedIterations + '/' + iterationsToCompute ;
+  }
+}
+
+function renderGraph() {
+  var constantLayout = Viva.Graph.Layout.constant(graph);
+  constantLayout.placeNode(function(node) {
+    return layout.getNodePosition(node.id);
+  });
+  var graphics = Viva.Graph.View.webglGraphics();
+  var renderer = Viva.Graph.View.renderer(graph, {
+    layout: constantLayout, // use our custom 'constant' layout
     graphics: graphics
-});
-renderer.run();
+  });
+  renderer.run();
+}
+
 return;
 
 function makeGraphFromQueryString() {
@@ -34,9 +59,10 @@ function makeGraphFromQueryString() {
   }
 }
 
-},{"../../index.js":2,"ngraph.generators":23,"query-string":28,"vivagraphjs":91}],2:[function(require,module,exports){
+},{"../../index.js":2,"ngraph.generators":24,"query-string":29,"vivagraphjs":92}],2:[function(require,module,exports){
 var work = require('webworkify');
 var tojson = require('ngraph.tojson');
+var eventify = require('ngraph.events');
 
 var createLayout = require('./lib/createLayout.js');
 var validateOptions = require('./options.js');
@@ -56,7 +82,7 @@ function createAsyncLayout(graph, options) {
   var pinStatus = Object.create(null);
   var linkPositions;
 
-  // Since this is failry common message, there is no need to recreate it every time:
+  // Since this is fairly common message, there is no need to recreate it every time:
   var stepMessage = { kind: messageKind.step };
 
   var positions = Object.create(null);
@@ -114,7 +140,7 @@ function createAsyncLayout(graph, options) {
     setNodePosition: asyncNodePosition,
 
     /**
-     * Gets rectange (or a box) that bounds the graph
+     * Gets rectangle (or a box) that bounds the graph
      */
     getGraphRect: getGraphRect,
 
@@ -124,6 +150,8 @@ function createAsyncLayout(graph, options) {
      */
     isNodePinned: isNodePinned
   };
+
+  eventify(api);
 
   return api;
 
@@ -232,6 +260,7 @@ function createAsyncLayout(graph, options) {
     if (kind === messageKind.cycleComplete) {
       setPositions(payload.positions, payload.systemStable);
       graphRect = payload.bbox;
+      api.fire('cycle', payload.iterations, payload.systemStable);
     } if (kind === messageKind.initDone) {
       pendingInitialization = false;
       asyncStep();
@@ -266,7 +295,7 @@ function assignPosition2d(oldPos, newPos) {
   oldPos.y = newPos.y;
 }
 
-},{"./lib/createLayout.js":3,"./lib/layoutWorker.js":4,"./lib/messages.js":5,"./options.js":93,"ngraph.tojson":27,"webworkify":92}],3:[function(require,module,exports){
+},{"./lib/createLayout.js":3,"./lib/layoutWorker.js":4,"./lib/messages.js":5,"./options.js":94,"ngraph.events":6,"ngraph.tojson":28,"webworkify":93}],3:[function(require,module,exports){
 var layout3d = require('ngraph.forcelayout3d');
 var layout2d = layout3d.get2dLayout;
 
@@ -280,7 +309,7 @@ function createLayout(graph, options) {
     layout2d(graph, options.physics);
 }
 
-},{"ngraph.forcelayout3d":6}],4:[function(require,module,exports){
+},{"ngraph.forcelayout3d":7}],4:[function(require,module,exports){
 var createLayout = require('./createLayout.js');
 var fromjson = require('ngraph.fromjson');
 var validateOptions = require('../options.js');
@@ -404,6 +433,7 @@ function layoutWorker(self) {
     }
 
     if (completedIterations >= asyncOptions.maxIterations) {
+      debugger;
       systemStable = true;
     }
 
@@ -412,13 +442,14 @@ function layoutWorker(self) {
       payload: {
         positions: positions,
         systemStable: systemStable,
-        bbox: layout.getGraphRect()
+        bbox: layout.getGraphRect(),
+        iterations: completedIterations
       }
     });
   }
 };
 
-},{"../options.js":93,"./createLayout.js":3,"./messages.js":5,"ngraph.fromjson":20}],5:[function(require,module,exports){
+},{"../options.js":94,"./createLayout.js":3,"./messages.js":5,"ngraph.fromjson":21}],5:[function(require,module,exports){
 /**
  * This file defines all possible messages between main thread and
  * web worker. The key is human readable message type, and the value is a
@@ -486,6 +517,96 @@ module.exports = {
 };
 
 },{}],6:[function(require,module,exports){
+module.exports = function(subject) {
+  validateSubject(subject);
+
+  var eventsStorage = createEventsStorage(subject);
+  subject.on = eventsStorage.on;
+  subject.off = eventsStorage.off;
+  subject.fire = eventsStorage.fire;
+  return subject;
+};
+
+function createEventsStorage(subject) {
+  // Store all event listeners to this hash. Key is event name, value is array
+  // of callback records.
+  //
+  // A callback record consists of callback function and its optional context:
+  // { 'eventName' => [{callback: function, ctx: object}] }
+  var registeredEvents = Object.create(null);
+
+  return {
+    on: function (eventName, callback, ctx) {
+      if (typeof callback !== 'function') {
+        throw new Error('callback is expected to be a function');
+      }
+      var handlers = registeredEvents[eventName];
+      if (!handlers) {
+        handlers = registeredEvents[eventName] = [];
+      }
+      handlers.push({callback: callback, ctx: ctx});
+
+      return subject;
+    },
+
+    off: function (eventName, callback) {
+      var wantToRemoveAll = (typeof eventName === 'undefined');
+      if (wantToRemoveAll) {
+        // Killing old events storage should be enough in this case:
+        registeredEvents = Object.create(null);
+        return subject;
+      }
+
+      if (registeredEvents[eventName]) {
+        var deleteAllCallbacksForEvent = (typeof callback !== 'function');
+        if (deleteAllCallbacksForEvent) {
+          delete registeredEvents[eventName];
+        } else {
+          var callbacks = registeredEvents[eventName];
+          for (var i = 0; i < callbacks.length; ++i) {
+            if (callbacks[i].callback === callback) {
+              callbacks.splice(i, 1);
+            }
+          }
+        }
+      }
+
+      return subject;
+    },
+
+    fire: function (eventName) {
+      var callbacks = registeredEvents[eventName];
+      if (!callbacks) {
+        return subject;
+      }
+
+      var fireArguments;
+      if (arguments.length > 1) {
+        fireArguments = Array.prototype.splice.call(arguments, 1);
+      }
+      for(var i = 0; i < callbacks.length; ++i) {
+        var callbackInfo = callbacks[i];
+        callbackInfo.callback.apply(callbackInfo.ctx, fireArguments);
+      }
+
+      return subject;
+    }
+  };
+}
+
+function validateSubject(subject) {
+  if (!subject) {
+    throw new Error('Eventify cannot use falsy object as events subject');
+  }
+  var reservedWords = ['on', 'fire', 'off'];
+  for (var i = 0; i < reservedWords.length; ++i) {
+    if (subject.hasOwnProperty(reservedWords[i])) {
+      throw new Error("Subject cannot be eventified, since it already has property '" + reservedWords[i] + "'");
+    }
+  }
+}
+
+},{}],7:[function(require,module,exports){
 /**
  * This module provides all required forces to regular ngraph.physics.simulator
  * to make it 3D simulator. Ideally ngraph.physics.simulator should operate
@@ -509,7 +630,7 @@ function createLayout(graph, physicsSettings) {
   return createLayout.get2dLayout(graph, physicsSettings);
 }
 
-},{"./lib/bounds":7,"./lib/createBody":8,"./lib/dragForce":9,"./lib/eulerIntegrator":10,"./lib/springForce":11,"ngraph.forcelayout":94,"ngraph.merge":13,"ngraph.quadtreebh3d":15}],7:[function(require,module,exports){
+},{"./lib/bounds":8,"./lib/createBody":9,"./lib/dragForce":10,"./lib/eulerIntegrator":11,"./lib/springForce":12,"ngraph.forcelayout":95,"ngraph.merge":14,"ngraph.quadtreebh3d":16}],8:[function(require,module,exports){
 module.exports = function (bodies, settings) {
   var random = require('ngraph.random').random(42);
   var boundingBox =  { x1: 0, y1: 0, z1: 0, x2: 0, y2: 0, z2: 0 };
@@ -608,14 +729,14 @@ module.exports = function (bodies, settings) {
   }
 };
 
-},{"ngraph.random":19}],8:[function(require,module,exports){
+},{"ngraph.random":20}],9:[function(require,module,exports){
 var physics = require('ngraph.physics.primitives');
 
 module.exports = function(pos) {
   return new physics.Body3d(pos);
 }
 
-},{"ngraph.physics.primitives":14}],9:[function(require,module,exports){
+},{"ngraph.physics.primitives":15}],10:[function(require,module,exports){
 /**
  * Represents 3d drag force, which reduces force value on each step by given
  * coefficient.
@@ -645,7 +766,7 @@ module.exports = function (options) {
   return api;
 };
 
-},{"ngraph.expose":12,"ngraph.merge":13}],10:[function(require,module,exports){
+},{"ngraph.expose":13,"ngraph.merge":14}],11:[function(require,module,exports){
 /**
  * Performs 3d forces integration, using given timestep. Uses Euler method to solve
  * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
@@ -695,7 +816,7 @@ function integrate(bodies, timeStep) {
   return (tx * tx + ty * ty + tz * tz)/bodies.length;
 }
 
-},{}],11:[function(require,module,exports){
+},{}],12:[function(require,module,exports){
 /**
  * Represents 3d spring force, which updates forces acting on two bodies, conntected
  * by a spring.
@@ -751,7 +872,7 @@ module.exports = function (options) {
   return api;
 }
 
-},{"ngraph.expose":12,"ngraph.merge":13,"ngraph.random":19}],12:[function(require,module,exports){
+},{"ngraph.expose":13,"ngraph.merge":14,"ngraph.random":20}],13:[function(require,module,exports){
 module.exports = exposeProperties;
 
 /**
@@ -797,7 +918,7 @@ function augment(source, target, key) {
   }
 }
 
-},{}],13:[function(require,module,exports){
+},{}],14:[function(require,module,exports){
 module.exports = merge;
 
 /**
@@ -830,7 +951,7 @@ function merge(target, options) {
   return target;
 }
 
-},{}],14:[function(require,module,exports){
+},{}],15:[function(require,module,exports){
 module.exports = {
   Body: Body,
   Vector2d: Vector2d,
@@ -897,7 +1018,7 @@ Vector3d.prototype.reset = function () {
   this.x = this.y = this.z = 0;
 };
 
-},{}],15:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 /**
  * This is Barnes Hut simulation algorithm for 3d case. Implementation
  * is highly optimized (avoids recusion and gc pressure)
@@ -1292,7 +1413,7 @@ function setChild(node, idx, child) {
   else if (idx === 7) node.quad7 = child;
 }
 
-},{"./insertStack":16,"./isSamePosition":17,"./node":18,"ngraph.random":19}],16:[function(require,module,exports){
+},{"./insertStack":17,"./isSamePosition":18,"./node":19,"ngraph.random":20}],17:[function(require,module,exports){
 module.exports = InsertStack;
 
 /**
@@ -1336,7 +1457,7 @@ function InsertStackElement(node, body) {
     this.body = body; // physical body which needs to be inserted to node
 }
 
-},{}],17:[function(require,module,exports){
+},{}],18:[function(require,module,exports){
 module.exports = function isSamePosition(point1, point2) {
     var dx = Math.abs(point1.x - point2.x);
     var dy = Math.abs(point1.y - point2.y);
@@ -1345,7 +1466,7 @@ module.exports = function isSamePosition(point1, point2) {
     return (dx < 1e-8 && dy < 1e-8 && dz < 1e-8);
 };
 
-},{}],18:[function(require,module,exports){
+},{}],19:[function(require,module,exports){
 /**
  * Internal data structure to represent 3D QuadTree node
  */
@@ -1389,7 +1510,7 @@ module.exports = function Node() {
   this.back = 0;
 };
 
-},{}],19:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 module.exports = {
   random: random,
   randomIterator: randomIterator
@@ -1476,7 +1597,7 @@ function randomIterator(array, customRandom) {
     };
 }
 
-},{}],20:[function(require,module,exports){
+},{}],21:[function(require,module,exports){
 module.exports = load;
 
 var createGraph = require('ngraph.graph');
@@ -1521,7 +1642,7 @@ function load(jsonGraph, nodeTransform, linkTransform) {
 
 function id(x) { return x; }
 
-},{"ngraph.graph":21}],21:[function(require,module,exports){
+},{"ngraph.graph":22}],22:[function(require,module,exports){
 /**
  * @fileOverview Contains definition of the core graph object.
  */
@@ -2100,97 +2221,9 @@ function makeLinkId(fromId, toId) {
   return hashCode(fromId.toString() + '👉 ' + toId.toString());
 }
 
-},{"ngraph.events":22}],22:[function(require,module,exports){
-module.exports = function(subject) {
-  validateSubject(subject);
-
-  var eventsStorage = createEventsStorage(subject);
-  subject.on = eventsStorage.on;
-  subject.off = eventsStorage.off;
-  subject.fire = eventsStorage.fire;
-  return subject;
-};
-
-function createEventsStorage(subject) {
-  // Store all event listeners to this hash. Key is event name, value is array
-  // of callback records.
-  //
-  // A callback record consists of callback function and its optional context:
-  // { 'eventName' => [{callback: function, ctx: object}] }
-  var registeredEvents = Object.create(null);
-
-  return {
-    on: function (eventName, callback, ctx) {
-      if (typeof callback !== 'function') {
-        throw new Error('callback is expected to be a function');
-      }
-      var handlers = registeredEvents[eventName];
-      if (!handlers) {
-        handlers = registeredEvents[eventName] = [];
-      }
-      handlers.push({callback: callback, ctx: ctx});
-
-      return subject;
-    },
-
-    off: function (eventName, callback) {
-      var wantToRemoveAll = (typeof eventName === 'undefined');
-      if (wantToRemoveAll) {
-        // Killing old events storage should be enough in this case:
-        registeredEvents = Object.create(null);
-        return subject;
-      }
-
-      if (registeredEvents[eventName]) {
-        var deleteAllCallbacksForEvent = (typeof callback !== 'function');
-        if (deleteAllCallbacksForEvent) {
-          delete registeredEvents[eventName];
-        } else {
-          var callbacks = registeredEvents[eventName];
-          for (var i = 0; i < callbacks.length; ++i) {
-            if (callbacks[i].callback === callback) {
-              callbacks.splice(i, 1);
-            }
-          }
-        }
-      }
-
-      return subject;
-    },
-
-    fire: function (eventName) {
-      var callbacks = registeredEvents[eventName];
-      if (!callbacks) {
-        return subject;
-      }
-
-      var fireArguments;
-      if (arguments.length > 1) {
-        fireArguments = Array.prototype.splice.call(arguments, 1);
-      }
-      for(var i = 0; i < callbacks.length; ++i) {
-        var callbackInfo = callbacks[i];
-        callbackInfo.callback.apply(callbackInfo.ctx, fireArguments);
-      }
-
-      return subject;
-    }
-  };
-}
-
-function validateSubject(subject) {
-  if (!subject) {
-    throw new Error('Eventify cannot use falsy object as events subject');
-  }
-  var reservedWords = ['on', 'fire', 'off'];
-  for (var i = 0; i < reservedWords.length; ++i) {
-    if (subject.hasOwnProperty(reservedWords[i])) {
-      throw new Error("Subject cannot be eventified, since it already has property '" + reservedWords[i] + "'");
-    }
-  }
-}
-
-},{}],23:[function(require,module,exports){
+},{"ngraph.events":23}],23:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],24:[function(require,module,exports){
 module.exports = {
   ladder: ladder,
   complete: complete,
@@ -2491,13 +2524,13 @@ function wattsStrogatz(n, k, p, seed) {
   return g;
 }
 
-},{"ngraph.graph":24,"ngraph.random":26}],24:[function(require,module,exports){
-arguments[4][21][0].apply(exports,arguments)
-},{"dup":21,"ngraph.events":25}],25:[function(require,module,exports){
+},{"ngraph.graph":25,"ngraph.random":27}],25:[function(require,module,exports){
 arguments[4][22][0].apply(exports,arguments)
-},{"dup":22}],26:[function(require,module,exports){
-arguments[4][19][0].apply(exports,arguments)
-},{"dup":19}],27:[function(require,module,exports){
+},{"dup":22,"ngraph.events":26}],26:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],27:[function(require,module,exports){
+arguments[4][20][0].apply(exports,arguments)
+},{"dup":20}],28:[function(require,module,exports){
 module.exports = save;
 
 function save(graph, customNodeTransform, customLinkTransform) {
@@ -2553,7 +2586,7 @@ function save(graph, customNodeTransform, customLinkTransform) {
   }
 }
 
-},{}],28:[function(require,module,exports){
+},{}],29:[function(require,module,exports){
 'use strict';
 var strictUriEncode = require('strict-uri-encode');
 
@@ -2611,7 +2644,7 @@ exports.stringify = function (obj) {
 	}).join('&') : '';
 };
 
-},{"strict-uri-encode":29}],29:[function(require,module,exports){
+},{"strict-uri-encode":30}],30:[function(require,module,exports){
 'use strict';
 module.exports = function (str) {
 	return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
@@ -2619,7 +2652,7 @@ module.exports = function (str) {
 	});
 };
 
-},{}],30:[function(require,module,exports){
+},{}],31:[function(require,module,exports){
 module.exports = intersect;
 
 /**
@@ -2720,11 +2753,11 @@ function intersect(
   return result;
 }
 
-},{}],31:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 module.exports.degree = require('./src/degree.js');
 module.exports.betweenness = require('./src/betweenness.js');
 
-},{"./src/betweenness.js":32,"./src/degree.js":33}],32:[function(require,module,exports){
+},{"./src/betweenness.js":33,"./src/degree.js":34}],33:[function(require,module,exports){
 module.exports = betweennes;
 
 /**
@@ -2836,7 +2869,7 @@ function betweennes(graph, oriented) {
   }
 }
 
-},{}],33:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
 module.exports = degree;
 
 /**
@@ -2897,9 +2930,9 @@ function inoutDegreeCalculator(links) {
   return links.length;
 }
 
-},{}],34:[function(require,module,exports){
-arguments[4][22][0].apply(exports,arguments)
-},{"dup":22}],35:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],36:[function(require,module,exports){
 module.exports = createLayout;
 module.exports.simulator = require('ngraph.physics.simulator');
 
@@ -3203,7 +3236,7 @@ function createLayout(graph, physicsSettings) {
 
 function noop() { }
 
-},{"ngraph.physics.simulator":36}],36:[function(require,module,exports){
+},{"ngraph.physics.simulator":37}],37:[function(require,module,exports){
 /**
  * Manages a simulation of physical forces acting on bodies and springs.
  */
@@ -3463,7 +3496,7 @@ function physicsSimulator(settings) {
   }
 };
 
-},{"./lib/bounds":37,"./lib/createBody":38,"./lib/dragForce":39,"./lib/eulerIntegrator":40,"./lib/spring":41,"./lib/springForce":42,"ngraph.expose":43,"ngraph.merge":52,"ngraph.quadtreebh":45}],37:[function(require,module,exports){
+},{"./lib/bounds":38,"./lib/createBody":39,"./lib/dragForce":40,"./lib/eulerIntegrator":41,"./lib/spring":42,"./lib/springForce":43,"ngraph.expose":44,"ngraph.merge":53,"ngraph.quadtreebh":46}],38:[function(require,module,exports){
 module.exports = function (bodies, settings) {
   var random = require('ngraph.random').random(42);
   var boundingBox =  { x1: 0, y1: 0, x2: 0, y2: 0 };
@@ -3545,14 +3578,14 @@ module.exports = function (bodies, settings) {
   }
 }
 
-},{"ngraph.random":53}],38:[function(require,module,exports){
+},{"ngraph.random":54}],39:[function(require,module,exports){
 var physics = require('ngraph.physics.primitives');
 
 module.exports = function(pos) {
   return new physics.Body(pos);
 }
 
-},{"ngraph.physics.primitives":44}],39:[function(require,module,exports){
+},{"ngraph.physics.primitives":45}],40:[function(require,module,exports){
 /**
  * Represents drag force, which reduces force value on each step by given
  * coefficient.
@@ -3581,7 +3614,7 @@ module.exports = function (options) {
   return api;
 };
 
-},{"ngraph.expose":43,"ngraph.merge":52}],40:[function(require,module,exports){
+},{"ngraph.expose":44,"ngraph.merge":53}],41:[function(require,module,exports){
 /**
  * Performs forces integration, using given timestep. Uses Euler method to solve
  * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
@@ -3624,7 +3657,7 @@ function integrate(bodies, timeStep) {
   return (tx * tx + ty * ty)/bodies.length;
 }
 
-},{}],41:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 module.exports = Spring;
 
 /**
@@ -3640,7 +3673,7 @@ function Spring(fromBody, toBody, length, coeff, weight) {
     this.weight = typeof weight === 'number' ? weight : 1;
 };
 
-},{}],42:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 /**
  * Represents spring force, which updates forces acting on two bodies, conntected
  * by a spring.
@@ -3692,11 +3725,11 @@ module.exports = function (options) {
   return api;
 }
 
-},{"ngraph.expose":43,"ngraph.merge":52,"ngraph.random":53}],43:[function(require,module,exports){
-arguments[4][12][0].apply(exports,arguments)
-},{"dup":12}],44:[function(require,module,exports){
-arguments[4][14][0].apply(exports,arguments)
-},{"dup":14}],45:[function(require,module,exports){
+},{"ngraph.expose":44,"ngraph.merge":53,"ngraph.random":54}],44:[function(require,module,exports){
+arguments[4][13][0].apply(exports,arguments)
+},{"dup":13}],45:[function(require,module,exports){
+arguments[4][15][0].apply(exports,arguments)
+},{"dup":15}],46:[function(require,module,exports){
 /**
  * This is Barnes Hut simulation algorithm for 2d case. Implementation
  * is highly optimized (avoids recusion and gc pressure)
@@ -4022,7 +4055,7 @@ function setChild(node, idx, child) {
   else if (idx === 3) node.quad3 = child;
 }
 
-},{"./insertStack":46,"./isSamePosition":47,"./node":48,"ngraph.random":53}],46:[function(require,module,exports){
+},{"./insertStack":47,"./isSamePosition":48,"./node":49,"ngraph.random":54}],47:[function(require,module,exports){
 module.exports = InsertStack;
 
 /**
@@ -4066,7 +4099,7 @@ function InsertStackElement(node, body) {
     this.body = body; // physical body which needs to be inserted to node
 }
 
-},{}],47:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 module.exports = function isSamePosition(point1, point2) {
     var dx = Math.abs(point1.x - point2.x);
     var dy = Math.abs(point1.y - point2.y);
@@ -4074,7 +4107,7 @@ module.exports = function isSamePosition(point1, point2) {
     return (dx < 1e-8 && dy < 1e-8);
 };
 
-},{}],48:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 /**
  * Internal data structure to represent 2D QuadTree node
  */
@@ -4106,11 +4139,11 @@ module.exports = function Node() {
   this.right = 0;
 };
 
-},{}],49:[function(require,module,exports){
-arguments[4][20][0].apply(exports,arguments)
-},{"dup":20,"ngraph.graph":51}],50:[function(require,module,exports){
-arguments[4][23][0].apply(exports,arguments)
-},{"dup":23,"ngraph.graph":51,"ngraph.random":53}],51:[function(require,module,exports){
+},{}],50:[function(require,module,exports){
+arguments[4][21][0].apply(exports,arguments)
+},{"dup":21,"ngraph.graph":52}],51:[function(require,module,exports){
+arguments[4][24][0].apply(exports,arguments)
+},{"dup":24,"ngraph.graph":52,"ngraph.random":54}],52:[function(require,module,exports){
 /**
  * @fileOverview Contains definition of the core graph object.
  */
@@ -4664,13 +4697,13 @@ function Link(fromId, toId, data, id) {
   this.id = id;
 }
 
-},{"ngraph.events":34}],52:[function(require,module,exports){
-arguments[4][13][0].apply(exports,arguments)
-},{"dup":13}],53:[function(require,module,exports){
-arguments[4][19][0].apply(exports,arguments)
-},{"dup":19}],54:[function(require,module,exports){
-arguments[4][27][0].apply(exports,arguments)
-},{"dup":27}],55:[function(require,module,exports){
+},{"ngraph.events":35}],53:[function(require,module,exports){
+arguments[4][14][0].apply(exports,arguments)
+},{"dup":14}],54:[function(require,module,exports){
+arguments[4][20][0].apply(exports,arguments)
+},{"dup":20}],55:[function(require,module,exports){
+arguments[4][28][0].apply(exports,arguments)
+},{"dup":28}],56:[function(require,module,exports){
 module.exports = svg;
 
 svg.compile = require('./lib/compile');
@@ -4783,7 +4816,7 @@ function augment(element) {
   }
 }
 
-},{"./lib/compile":56,"./lib/compile_template":57,"add-event-listener":59}],56:[function(require,module,exports){
+},{"./lib/compile":57,"./lib/compile_template":58,"add-event-listener":60}],57:[function(require,module,exports){
 var parser = require('./domparser.js');
 var svg = require('../');
 
@@ -4811,7 +4844,7 @@ function addNamespaces(text) {
   }
 }
 
-},{"../":55,"./domparser.js":58}],57:[function(require,module,exports){
+},{"../":56,"./domparser.js":59}],58:[function(require,module,exports){
 module.exports = template;
 
 var BINDING_EXPR = /{{(.+?)}}/;
@@ -4905,7 +4938,7 @@ function bindTextContent(element, allBindings) {
   }
 }
 
-},{}],58:[function(require,module,exports){
+},{}],59:[function(require,module,exports){
 module.exports = createDomparser();
 
 function createDomparser() {
@@ -4921,7 +4954,7 @@ function fail() {
   throw new Error('DOMParser is not supported by this platform. Please open issue here https://github.com/anvaka/simplesvg');
 }
 
-},{}],59:[function(require,module,exports){
+},{}],60:[function(require,module,exports){
 addEventListener.removeEventListener = removeEventListener
 addEventListener.addEventListener = addEventListener
 
@@ -4969,7 +5002,7 @@ function oldIEDetach(el, eventName, listener, useCapture) {
   el.detachEvent('on' + eventName, listener)
 }
 
-},{}],60:[function(require,module,exports){
+},{}],61:[function(require,module,exports){
 var centrality = require('ngraph.centrality');
 
 module.exports = centralityWrapper;
@@ -5007,7 +5040,7 @@ function toVivaGraphCentralityFormat(centrality) {
   }
 }
 
-},{"ngraph.centrality":31}],61:[function(require,module,exports){
+},{"ngraph.centrality":32}],62:[function(require,module,exports){
 /**
  * @fileOverview Contains collection of primitive operations under graph.
  *
@@ -5042,7 +5075,7 @@ function operations() {
     };
 };
 
-},{}],62:[function(require,module,exports){
+},{}],63:[function(require,module,exports){
 /**
  * @author Andrei Kashcha (aka anvaka) / https://github.com/anvaka
  */
@@ -5091,7 +5124,7 @@ function domInputManager(graph, graphics) {
   }
 }
 
-},{"./dragndrop.js":63}],63:[function(require,module,exports){
+},{"./dragndrop.js":64}],64:[function(require,module,exports){
 /**
  * @author Andrei Kashcha (aka anvaka) / https://github.com/anvaka
  */
@@ -5374,7 +5407,7 @@ function dragndrop(element) {
     };
 }
 
-},{"../Utils/browserInfo.js":67,"../Utils/documentEvents.js":68,"../Utils/findElementPosition.js":69}],64:[function(require,module,exports){
+},{"../Utils/browserInfo.js":68,"../Utils/documentEvents.js":69,"../Utils/findElementPosition.js":70}],65:[function(require,module,exports){
 /**
  * @author Andrei Kashcha (aka anvaka) / https://github.com/anvaka
  */
@@ -5445,7 +5478,7 @@ function webglInputManager(graph, graphics) {
     };
 }
 
-},{"../WebGL/webglInputEvents.js":85}],65:[function(require,module,exports){
+},{"../WebGL/webglInputEvents.js":86}],66:[function(require,module,exports){
 module.exports = constant;
 
 var merge = require('ngraph.merge');
@@ -5644,7 +5677,7 @@ function constant(graph, userSettings) {
     }
 }
 
-},{"../Utils/rect.js":73,"ngraph.merge":52,"ngraph.random":53}],66:[function(require,module,exports){
+},{"../Utils/rect.js":74,"ngraph.merge":53,"ngraph.random":54}],67:[function(require,module,exports){
 /**
  * This module provides compatibility layer with 0.6.x library. It will be
  * removed in the next version
@@ -5689,7 +5722,7 @@ function backwardCompatibleEvents(g) {
   }
 }
 
-},{"ngraph.events":34}],67:[function(require,module,exports){
+},{"ngraph.events":35}],68:[function(require,module,exports){
 module.exports = browserInfo();
 
 function browserInfo() {
@@ -5718,7 +5751,7 @@ function browserInfo() {
   };
 }
 
-},{}],68:[function(require,module,exports){
+},{}],69:[function(require,module,exports){
 var nullEvents = require('./nullEvents.js');
 
 module.exports = createDocumentEvents();
@@ -5742,7 +5775,7 @@ function off(eventName, handler) {
   document.removeEventListener(eventName, handler);
 }
 
-},{"./nullEvents.js":72}],69:[function(require,module,exports){
+},{"./nullEvents.js":73}],70:[function(require,module,exports){
 /**
  * Finds the absolute position of an element on a page
  */
@@ -5761,7 +5794,7 @@ function findElementPosition(obj) {
     return [curleft, curtop];
 }
 
-},{}],70:[function(require,module,exports){
+},{}],71:[function(require,module,exports){
 module.exports = getDimension;
 
 function getDimension(container) {
@@ -5783,7 +5816,7 @@ function getDimension(container) {
     };
 }
 
-},{}],71:[function(require,module,exports){
+},{}],72:[function(require,module,exports){
 var intersect = require('gintersect');
 
 module.exports = intersectRect;
@@ -5795,7 +5828,7 @@ function intersectRect(left, top, right, bottom, x1, y1, x2, y2) {
     intersect(right, top, left, top, x1, y1, x2, y2);
 }
 
-},{"gintersect":30}],72:[function(require,module,exports){
+},{"gintersect":31}],73:[function(require,module,exports){
 module.exports = createNullEvents();
 
 function createNullEvents() {
@@ -5808,7 +5841,7 @@ function createNullEvents() {
 
 function noop() { }
 
-},{}],73:[function(require,module,exports){
+},{}],74:[function(require,module,exports){
 module.exports = Rect;
 
 /**
@@ -5821,7 +5854,7 @@ function Rect (x1, y1, x2, y2) {
     this.y2 = y2 || 0;
 }
 
-},{}],74:[function(require,module,exports){
+},{}],75:[function(require,module,exports){
 (function (global){
 /**
  * @author Andrei Kashcha (aka anvaka) / http://anvaka.blogspot.com
@@ -5917,7 +5950,7 @@ function createTimer() {
 function noop() {}
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],75:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 var nullEvents = require('./nullEvents.js');
 
 module.exports = createDocumentEvents();
@@ -5942,7 +5975,7 @@ function off(eventName, handler) {
 }
 
 
-},{"./nullEvents.js":72}],76:[function(require,module,exports){
+},{"./nullEvents.js":73}],77:[function(require,module,exports){
 /**
  * @fileOverview Defines a graph renderer that uses CSS based drawings.
  *
@@ -6422,7 +6455,7 @@ function renderer(graph, settings) {
   }
 }
 
-},{"../Input/domInputManager.js":62,"../Input/dragndrop.js":63,"../Utils/getDimensions.js":70,"../Utils/timer.js":74,"../Utils/windowEvents.js":75,"./svgGraphics.js":77,"ngraph.events":34,"ngraph.forcelayout":35}],77:[function(require,module,exports){
+},{"../Input/domInputManager.js":63,"../Input/dragndrop.js":64,"../Utils/getDimensions.js":71,"../Utils/timer.js":75,"../Utils/windowEvents.js":76,"./svgGraphics.js":78,"ngraph.events":35,"ngraph.forcelayout":36}],78:[function(require,module,exports){
 /**
  * @fileOverview Defines a graph renderer that uses SVG based drawings.
  *
@@ -6780,7 +6813,7 @@ function svgGraphics() {
     }
 }
 
-},{"../Input/domInputManager.js":62,"ngraph.events":34,"simplesvg":55}],78:[function(require,module,exports){
+},{"../Input/domInputManager.js":63,"ngraph.events":35,"simplesvg":56}],79:[function(require,module,exports){
 /**
  * @fileOverview Defines a graph renderer that uses WebGL based drawings.
  *
@@ -7362,7 +7395,7 @@ function webglGraphics(options) {
     return graphics;
 }
 
-},{"../Input/webglInputManager.js":64,"../WebGL/webglLine.js":86,"../WebGL/webglLinkProgram.js":87,"../WebGL/webglNodeProgram.js":88,"../WebGL/webglSquare.js":89,"ngraph.events":34,"ngraph.merge":52}],79:[function(require,module,exports){
+},{"../Input/webglInputManager.js":65,"../WebGL/webglLine.js":87,"../WebGL/webglLinkProgram.js":88,"../WebGL/webglNodeProgram.js":89,"../WebGL/webglSquare.js":90,"ngraph.events":35,"ngraph.merge":53}],80:[function(require,module,exports){
 module.exports = parseColor;
 
 function parseColor(color) {
@@ -7386,7 +7419,7 @@ function parseColor(color) {
   return parsedColor;
 }
 
-},{}],80:[function(require,module,exports){
+},{}],81:[function(require,module,exports){
 module.exports = Texture;
 
 /**
@@ -7399,7 +7432,7 @@ function Texture(size) {
   this.canvas.width = this.canvas.height = size;
 }
 
-},{}],81:[function(require,module,exports){
+},{}],82:[function(require,module,exports){
 /**
  * @fileOverview Utility functions for webgl rendering.
  *
@@ -7506,7 +7539,7 @@ function swapArrayPart(array, from, to, elementsCount) {
   }
 }
 
-},{}],82:[function(require,module,exports){
+},{}],83:[function(require,module,exports){
 var Texture = require('./texture.js');
 
 module.exports = webglAtlas;
@@ -7710,7 +7743,7 @@ function isPowerOf2(n) {
   return (n & (n - 1)) === 0;
 }
 
-},{"./texture.js":80}],83:[function(require,module,exports){
+},{"./texture.js":81}],84:[function(require,module,exports){
 module.exports = webglImage;
 
 /**
@@ -7742,7 +7775,7 @@ function webglImage(size, src) {
     };
 }
 
-},{}],84:[function(require,module,exports){
+},{}],85:[function(require,module,exports){
 /**
  * @fileOverview Defines an image nodes for webglGraphics class.
  * Shape of nodes is square.
@@ -8006,7 +8039,7 @@ function createNodeVertexShader() {
   ].join("\n");
 }
 
-},{"./webgl.js":81,"./webglAtlas.js":82}],85:[function(require,module,exports){
+},{"./webgl.js":82,"./webglAtlas.js":83}],86:[function(require,module,exports){
 var documentEvents = require('../Utils/documentEvents.js');
 
 module.exports = webglInputEvents;
@@ -8245,11 +8278,13 @@ function webglInputEvents(webglGraphics) {
         pos.x = e.clientX - boundRect.left;
         pos.y = e.clientY - boundRect.top;
 
-        args = [getNodeAtClientPos(pos), e];
+        var nodeAtClientPos = getNodeAtClientPos(pos);
+        var sameNode = nodeAtClientPos === lastFound;
+        args = [nodeAtClientPos || lastFound, e];
         if (args[0]) {
           window.document.onselectstart = prevSelectStart;
 
-          if (clickTime - lastClickTime < 400 && args[0] === lastFound) {
+          if (clickTime - lastClickTime < 400 && sameNode) {
             invoke(dblClickCallback, args);
           } else {
             invoke(clickCallback, args);
@@ -8264,7 +8299,7 @@ function webglInputEvents(webglGraphics) {
   }
 }
 
-},{"../Utils/documentEvents.js":68}],86:[function(require,module,exports){
+},{"../Utils/documentEvents.js":69}],87:[function(require,module,exports){
 var parseColor = require('./parseColor.js');
 
 module.exports = webglLine;
@@ -8285,7 +8320,7 @@ function webglLine(color) {
   };
 }
 
-},{"./parseColor.js":79}],87:[function(require,module,exports){
+},{"./parseColor.js":80}],88:[function(require,module,exports){
 /**
  * @fileOverview Defines a naive form of links for webglGraphics class.
  * This form allows to change color of links.
@@ -8443,7 +8478,7 @@ function webglLinkProgram() {
     };
 }
 
-},{"./webgl.js":81}],88:[function(require,module,exports){
+},{"./webgl.js":82}],89:[function(require,module,exports){
 /**
  * @fileOverview Defines a naive form of nodes for webglGraphics class.
  * This form allows to change color of node. Shape of nodes is rectangular.
@@ -8608,7 +8643,7 @@ function webglNodeProgram() {
   }
 }
 
-},{"./webgl.js":81}],89:[function(require,module,exports){
+},{"./webgl.js":82}],90:[function(require,module,exports){
 var parseColor = require('./parseColor.js');
 
 module.exports = webglSquare;
@@ -8634,11 +8669,11 @@ function webglSquare(size, color) {
   };
 }
 
-},{"./parseColor.js":79}],90:[function(require,module,exports){
+},{"./parseColor.js":80}],91:[function(require,module,exports){
 // todo: this should be generated at build time.
 module.exports = '0.8.1';
 
-},{}],91:[function(require,module,exports){
+},{}],92:[function(require,module,exports){
 /**
  * This is an entry point for global namespace. If you want to use separate
  * modules individually - you are more than welcome to do so.
@@ -8752,7 +8787,7 @@ Viva.Graph = {
 
 module.exports = Viva;
 
-},{"./Algorithms/centrality.js":60,"./Algorithms/operations.js":61,"./Input/domInputManager.js":62,"./Input/dragndrop.js":63,"./Input/webglInputManager.js":64,"./Layout/constant.js":65,"./Utils/backwardCompatibleEvents.js":66,"./Utils/browserInfo.js":67,"./Utils/findElementPosition.js":69,"./Utils/getDimensions.js":70,"./Utils/intersectRect.js":71,"./Utils/rect.js":73,"./Utils/timer.js":74,"./View/renderer.js":76,"./View/svgGraphics.js":77,"./View/webglGraphics.js":78,"./WebGL/parseColor.js":79,"./WebGL/texture.js":80,"./WebGL/webgl.js":81,"./WebGL/webglAtlas.js":82,"./WebGL/webglImage.js":83,"./WebGL/webglImageNodeProgram.js":84,"./WebGL/webglInputEvents.js":85,"./WebGL/webglLine.js":86,"./WebGL/webglLinkProgram.js":87,"./WebGL/webglNodeProgram.js":88,"./WebGL/webglSquare.js":89,"./version.js":90,"gintersect":30,"ngraph.events":34,"ngraph.forcelayout":35,"ngraph.fromjson":49,"ngraph.generators":50,"ngraph.graph":51,"ngraph.merge":52,"ngraph.random":53,"ngraph.tojson":54,"simplesvg":55}],92:[function(require,module,exports){
+},{"./Algorithms/centrality.js":61,"./Algorithms/operations.js":62,"./Input/domInputManager.js":63,"./Input/dragndrop.js":64,"./Input/webglInputManager.js":65,"./Layout/constant.js":66,"./Utils/backwardCompatibleEvents.js":67,"./Utils/browserInfo.js":68,"./Utils/findElementPosition.js":70,"./Utils/getDimensions.js":71,"./Utils/intersectRect.js":72,"./Utils/rect.js":74,"./Utils/timer.js":75,"./View/renderer.js":77,"./View/svgGraphics.js":78,"./View/webglGraphics.js":79,"./WebGL/parseColor.js":80,"./WebGL/texture.js":81,"./WebGL/webgl.js":82,"./WebGL/webglAtlas.js":83,"./WebGL/webglImage.js":84,"./WebGL/webglImageNodeProgram.js":85,"./WebGL/webglInputEvents.js":86,"./WebGL/webglLine.js":87,"./WebGL/webglLinkProgram.js":88,"./WebGL/webglNodeProgram.js":89,"./WebGL/webglSquare.js":90,"./version.js":91,"gintersect":31,"ngraph.events":35,"ngraph.forcelayout":36,"ngraph.fromjson":50,"ngraph.generators":51,"ngraph.graph":52,"ngraph.merge":53,"ngraph.random":54,"ngraph.tojson":55,"simplesvg":56}],93:[function(require,module,exports){
 var bundleFn = arguments[3];
 var sources = arguments[4];
 var cache = arguments[5];
@@ -8809,7 +8844,7 @@ module.exports = function (fn) {
     ));
 };
 
-},{}],93:[function(require,module,exports){
+},{}],94:[function(require,module,exports){
 /**
  * This file defines configuration options for the asyncforce module. Every
  * configuration is optional. You can find its description and default value below.
@@ -8860,7 +8895,7 @@ function validateOptions(options) {
   return options;
 }
 
-},{}],94:[function(require,module,exports){
+},{}],95:[function(require,module,exports){
 module.exports = createLayout;
 module.exports.simulator = require('ngraph.physics.simulator');
 
@@ -9173,9 +9208,9 @@ function createLayout(graph, physicsSettings) {
 
 function noop() { }
 
-},{"ngraph.events":95,"ngraph.physics.simulator":96}],95:[function(require,module,exports){
-arguments[4][22][0].apply(exports,arguments)
-},{"dup":22}],96:[function(require,module,exports){
+},{"ngraph.events":96,"ngraph.physics.simulator":97}],96:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],97:[function(require,module,exports){
 /**
  * Manages a simulation of physical forces acting on bodies and springs.
  */
@@ -9453,13 +9488,13 @@ function physicsSimulator(settings) {
   }
 };
 
-},{"./lib/bounds":97,"./lib/createBody":98,"./lib/dragForce":99,"./lib/eulerIntegrator":100,"./lib/spring":101,"./lib/springForce":102,"ngraph.events":103,"ngraph.expose":104,"ngraph.merge":105,"ngraph.quadtreebh":107}],97:[function(require,module,exports){
-arguments[4][37][0].apply(exports,arguments)
-},{"dup":37,"ngraph.random":111}],98:[function(require,module,exports){
+},{"./lib/bounds":98,"./lib/createBody":99,"./lib/dragForce":100,"./lib/eulerIntegrator":101,"./lib/spring":102,"./lib/springForce":103,"ngraph.events":104,"ngraph.expose":105,"ngraph.merge":106,"ngraph.quadtreebh":108}],98:[function(require,module,exports){
 arguments[4][38][0].apply(exports,arguments)
-},{"dup":38,"ngraph.physics.primitives":106}],99:[function(require,module,exports){
+},{"dup":38,"ngraph.random":112}],99:[function(require,module,exports){
 arguments[4][39][0].apply(exports,arguments)
-},{"dup":39,"ngraph.expose":104,"ngraph.merge":105}],100:[function(require,module,exports){
+},{"dup":39,"ngraph.physics.primitives":107}],100:[function(require,module,exports){
+arguments[4][40][0].apply(exports,arguments)
+},{"dup":40,"ngraph.expose":105,"ngraph.merge":106}],101:[function(require,module,exports){
 /**
  * Performs forces integration, using given timestep. Uses Euler method to solve
  * differential equation (http://en.wikipedia.org/wiki/Euler_method ).
@@ -9506,26 +9541,26 @@ function integrate(bodies, timeStep) {
   return (tx * tx + ty * ty)/max;
 }
 
-},{}],101:[function(require,module,exports){
-arguments[4][41][0].apply(exports,arguments)
-},{"dup":41}],102:[function(require,module,exports){
+},{}],102:[function(require,module,exports){
 arguments[4][42][0].apply(exports,arguments)
-},{"dup":42,"ngraph.expose":104,"ngraph.merge":105,"ngraph.random":111}],103:[function(require,module,exports){
-arguments[4][22][0].apply(exports,arguments)
-},{"dup":22}],104:[function(require,module,exports){
-arguments[4][12][0].apply(exports,arguments)
-},{"dup":12}],105:[function(require,module,exports){
+},{"dup":42}],103:[function(require,module,exports){
+arguments[4][43][0].apply(exports,arguments)
+},{"dup":43,"ngraph.expose":105,"ngraph.merge":106,"ngraph.random":112}],104:[function(require,module,exports){
+arguments[4][6][0].apply(exports,arguments)
+},{"dup":6}],105:[function(require,module,exports){
 arguments[4][13][0].apply(exports,arguments)
 },{"dup":13}],106:[function(require,module,exports){
 arguments[4][14][0].apply(exports,arguments)
 },{"dup":14}],107:[function(require,module,exports){
-arguments[4][45][0].apply(exports,arguments)
-},{"./insertStack":108,"./isSamePosition":109,"./node":110,"dup":45,"ngraph.random":111}],108:[function(require,module,exports){
+arguments[4][15][0].apply(exports,arguments)
+},{"dup":15}],108:[function(require,module,exports){
 arguments[4][46][0].apply(exports,arguments)
-},{"dup":46}],109:[function(require,module,exports){
+},{"./insertStack":109,"./isSamePosition":110,"./node":111,"dup":46,"ngraph.random":112}],109:[function(require,module,exports){
 arguments[4][47][0].apply(exports,arguments)
 },{"dup":47}],110:[function(require,module,exports){
 arguments[4][48][0].apply(exports,arguments)
 },{"dup":48}],111:[function(require,module,exports){
-arguments[4][19][0].apply(exports,arguments)
-},{"dup":19}]},{},[1]);
+arguments[4][49][0].apply(exports,arguments)
+},{"dup":49}],112:[function(require,module,exports){
+arguments[4][20][0].apply(exports,arguments)
+},{"dup":20}]},{},[1]);
